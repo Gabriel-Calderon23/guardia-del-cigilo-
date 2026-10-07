@@ -28,8 +28,10 @@ import {
   type PatrolPauseState,
 } from "../../domain/navigation/pauseBehavior";
 import type { SearchAlgorithm, SearchResult, SearchStatus } from "../../domain/navigation/search";
+import { evaluateAlertLevel, type AlertConfig, type AlertLevel } from "../../domain/perception/alert";
 import { timeSinceLastPerception } from "../../domain/perception/memory";
 import type { VisionReason, VisionResult } from "../../domain/perception/perception";
+import { visionStyleFor } from "../presentation/visionStyle";
 
 const PLAYER_SPEED = 190;
 const GUARD_SPEED = 115;
@@ -42,6 +44,13 @@ const GAZE_SWEEP_RADIANS = Math.PI / 3;
 const PATROL_PAUSE_CONFIG: PatrolPauseConfig = {
   pauseMs: PATROL_PAUSE_MS,
   sweepRadians: GAZE_SWEEP_RADIANS,
+};
+const SUSPICION_WINDOW_MS = 2000;
+const ALERT_CONFIG: AlertConfig = { suspicionWindowMs: SUSPICION_WINDOW_MS };
+const ALERT_LABELS: Readonly<Record<AlertLevel, string>> = {
+  patrol: "PATRULLA",
+  suspicion: "SOSPECHA",
+  alert: "ALERTA",
 };
 const STATUS_LABELS: Readonly<Record<SearchStatus, string>> = {
   success: "EXITO",
@@ -85,6 +94,7 @@ export class GameScene extends Phaser.Scene {
   private patrolIndex = 0;
   private pauseState: PatrolPauseState = initialPatrolPause();
   private perceptionState: PerceptionSimulationState = initialPerceptionState();
+  private alertLevel: AlertLevel = "patrol";
 
   public constructor() {
     super("GameScene");
@@ -101,6 +111,7 @@ export class GameScene extends Phaser.Scene {
     this.patrolIndex = 0;
     this.pauseState = startPatrolPause(this.guardFacing, PATROL_PAUSE_CONFIG);
     this.perceptionState = initialPerceptionState();
+    this.alertLevel = "patrol";
     this.cameras.main.setBackgroundColor("#10161c");
     this.drawGrid();
 
@@ -376,15 +387,25 @@ export class GameScene extends Phaser.Scene {
     });
     this.perceptionState = frame.state;
 
-    this.drawPerception(frame.vision);
+    this.alertLevel = evaluateAlertLevel(
+      {
+        visionVisible: frame.vision.visible,
+        soundHeard: frame.soundHeard,
+        memoryAgeMs: timeSinceLastPerception(frame.state.memory, time),
+      },
+      ALERT_CONFIG,
+    );
+
+    this.drawPerception(this.alertLevel);
     this.updateTelemetry(time, frame.vision, frame.soundHeard);
   }
 
-  private drawPerception(vision: VisionResult): void {
+  private drawPerception(level: AlertLevel): void {
     this.perceptionGraphics.clear();
     const facingAngle = Math.atan2(this.guardFacing.y, this.guardFacing.x);
     const halfFieldOfView = FIELD_OF_VIEW / 2;
-    this.perceptionGraphics.fillStyle(vision.visible ? 0x73c991 : 0x6b8afd, 0.16);
+    const style = visionStyleFor(level);
+    this.perceptionGraphics.fillStyle(style.color, style.alpha);
     this.perceptionGraphics.beginPath();
     this.perceptionGraphics.moveTo(this.guard.x, this.guard.y);
     this.perceptionGraphics.arc(
@@ -425,6 +446,7 @@ export class GameScene extends Phaser.Scene {
     this.navigationHud.setText([
       ...this.navigationSummary,
       this.patrolTelemetryLine(),
+      `alerta ${ALERT_LABELS[this.alertLevel]}`,
       `vision ${VISION_LABELS[vision.reason]}`,
       `sonido ${sound}`,
       memory,

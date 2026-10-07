@@ -107,11 +107,41 @@ function lineIsOccluded(
   from: Vector2,
   to: Vector2,
 ): boolean {
+  return traceVisionRay(map, tileSize, from, to).blocked;
+}
+
+export interface RayTrace {
+  /** `true` si el segmento alcanza una celda bloqueada. */
+  readonly blocked: boolean;
+  /** Distancia desde `from` hasta la primera celda bloqueada; equivale a la
+   *  longitud total del segmento cuando no hay bloqueo. */
+  readonly distance: number;
+}
+
+/**
+ * Recorre las celdas atravesadas por el segmento `from`->`to` con el mismo
+ * criterio conservador de esquinas que la visión, y devuelve si hay bloqueo y
+ * a qué distancia comienza. Lo reutilizan `evaluateVision` (oclusión) y la
+ * malla del cono (`computeVisionPolygon`).
+ */
+export function traceVisionRay(
+  map: GridMap,
+  tileSize: number,
+  from: Vector2,
+  to: Vector2,
+): RayTrace {
+  assertFiniteVector(from);
+  assertFiniteVector(to);
   const start = worldToCell(from, tileSize);
   const end = worldToCell(to, tileSize);
-  if (!isWalkable(map, start) || !isWalkable(map, end)) {
-    return true;
+  const totalDistance = Math.hypot(to.x - from.x, to.y - from.y);
+  if (!isWalkable(map, start)) {
+    return { blocked: true, distance: 0 };
   }
+  if (start.x === end.x && start.y === end.y) {
+    return { blocked: !isWalkable(map, end), distance: 0 };
+  }
+
   let x = start.x;
   let y = start.y;
   const deltaX = to.x - from.x;
@@ -130,24 +160,30 @@ function lineIsOccluded(
     const crossingY = distanceY * absoluteDeltaX;
 
     if (crossingX === crossingY) {
+      const cornerDistance = (distanceX / absoluteDeltaX) * totalDistance;
       if (
         !isWalkable(map, { x: x + stepX, y })
         || !isWalkable(map, { x, y: y + stepY })
       ) {
-        return true;
+        return { blocked: true, distance: cornerDistance };
       }
       x += stepX;
       y += stepY;
+      if (!isWalkable(map, { x, y })) {
+        return { blocked: true, distance: cornerDistance };
+      }
     } else if (crossingX < crossingY) {
       x += stepX;
+      if (!isWalkable(map, { x, y })) {
+        return { blocked: true, distance: (distanceX / absoluteDeltaX) * totalDistance };
+      }
     } else {
       y += stepY;
-    }
-
-    if (!isWalkable(map, { x, y })) {
-      return true;
+      if (!isWalkable(map, { x, y })) {
+        return { blocked: true, distance: (distanceY / absoluteDeltaY) * totalDistance };
+      }
     }
   }
 
-  return false;
+  return { blocked: false, distance: totalDistance };
 }
