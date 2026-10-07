@@ -44,3 +44,14 @@ function expandAreas(areas: readonly BlockedRectangle[]): GridPoint[] {
 }
 
 export const LAB_MAP = createGridMap(GRID_WIDTH, GRID_HEIGHT, expandAreas(BLOCKED_AREAS));
+
+// Ruta de patrulla cíclica del guardia. El primer punto coincide con la
+// posición inicial para que el reinicio (R) conserve el estado reproducible.
+// Los puntos se verifican transitables y conectados por A* en
+// tests/navigation/patrolRoute.test.ts.
+export const PATROL_POINTS: readonly GridPoint[] = [
+  GUARD_START,
+  { x: 27, y: 2 },
+  { x: 5, y: 2 },
+  { x: 2, y: 17 },
+];

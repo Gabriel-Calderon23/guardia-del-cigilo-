@@ -23,3 +23,17 @@ export function assertFiniteVector(vector: Vector2): void {
     throw new Error("Vector components must be finite.");
   }
 }
+
+/** Rota un vector en el plano por `radians` (sentido antihorario). Devuelve una copia. */
+export function rotateVector(vector: Vector2, radians: number): Vector2 {
+  assertFiniteVector(vector);
+  if (!Number.isFinite(radians)) {
+    throw new Error("Rotation angle must be finite.");
+  }
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+  return {
+    x: vector.x * cosine - vector.y * sine,
+    y: vector.x * sine + vector.y * cosine,
+  };
+}
