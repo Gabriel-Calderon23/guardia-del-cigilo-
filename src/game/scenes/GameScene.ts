@@ -31,6 +31,7 @@ import type { SearchAlgorithm, SearchResult, SearchStatus } from "../../domain/n
 import { evaluateAlertLevel, type AlertConfig, type AlertLevel } from "../../domain/perception/alert";
 import { timeSinceLastPerception } from "../../domain/perception/memory";
 import type { VisionReason, VisionResult } from "../../domain/perception/perception";
+import { ALERT_FEEDBACK, shouldTriggerAlertFeedback } from "../presentation/alertFeedback";
 import { visionStyleFor } from "../presentation/visionStyle";
 
 const PLAYER_SPEED = 190;
@@ -83,6 +84,8 @@ export class GameScene extends Phaser.Scene {
   private targetMarker!: Phaser.GameObjects.Arc;
   private lastKnownMarker!: Phaser.GameObjects.Arc;
   private navigationHud!: Phaser.GameObjects.Text;
+  private titleText!: Phaser.GameObjects.Text;
+  private uiCamera!: Phaser.Cameras.Scene2D.Camera;
   private navigationAlgorithm: SearchAlgorithm = "astar";
   private navigationGoal: GridPoint = GUARD_START;
   private navigationSummary: readonly string[] = [];
@@ -113,6 +116,7 @@ export class GameScene extends Phaser.Scene {
     this.perceptionState = initialPerceptionState();
     this.alertLevel = "patrol";
     this.cameras.main.setBackgroundColor("#10161c");
+    this.cameras.main.resetFX();
     this.drawGrid();
 
     const walls = this.physics.add.staticGroup();
@@ -167,7 +171,7 @@ export class GameScene extends Phaser.Scene {
       .setDepth(5)
       .setVisible(false);
 
-    this.add
+    this.titleText = this.add
       .text(16, 14, "H3 / PERCEPCION Y MOVIMIENTO", {
         color: "#9eb4c2",
         fontFamily: "monospace",
@@ -190,6 +194,19 @@ export class GameScene extends Phaser.Scene {
     this.input.on("pointerdown", this.handlePointerDown, this);
     this.renderPatrolLeg();
     this.updatePerception(0);
+
+    this.uiCamera = this.cameras.add(
+      0,
+      0,
+      GRID_WIDTH * TILE_SIZE,
+      GRID_HEIGHT * TILE_SIZE,
+    );
+    this.cameras.main.ignore([this.titleText, this.navigationHud]);
+    this.uiCamera.ignore(
+      this.children.list.filter(
+        (child) => child !== this.titleText && child !== this.navigationHud,
+      ),
+    );
   }
 
   public update(time: number, delta: number): void {
@@ -387,7 +404,7 @@ export class GameScene extends Phaser.Scene {
     });
     this.perceptionState = frame.state;
 
-    this.alertLevel = evaluateAlertLevel(
+    const nextAlertLevel = evaluateAlertLevel(
       {
         visionVisible: frame.vision.visible,
         soundHeard: frame.soundHeard,
@@ -395,9 +412,31 @@ export class GameScene extends Phaser.Scene {
       },
       ALERT_CONFIG,
     );
+    if (shouldTriggerAlertFeedback(this.alertLevel, nextAlertLevel)) {
+      this.triggerAlertFeedback();
+    }
+    this.alertLevel = nextAlertLevel;
 
     this.drawPerception(this.alertLevel);
     this.updateTelemetry(time, frame.vision, frame.soundHeard);
+  }
+
+  private triggerAlertFeedback(): void {
+    const worldCamera = this.cameras.main;
+    worldCamera.resetFX();
+    worldCamera.shake(ALERT_FEEDBACK.shakeDurationMs, ALERT_FEEDBACK.shakeIntensity);
+    this.flashCamera(worldCamera);
+    this.uiCamera.resetFX();
+    this.flashCamera(this.uiCamera);
+  }
+
+  private flashCamera(camera: Phaser.Cameras.Scene2D.Camera): void {
+    camera.flash(
+      ALERT_FEEDBACK.flashDurationMs,
+      (ALERT_FEEDBACK.flashColor >> 16) & 0xff,
+      (ALERT_FEEDBACK.flashColor >> 8) & 0xff,
+      ALERT_FEEDBACK.flashColor & 0xff,
+    );
   }
 
   private drawPerception(level: AlertLevel): void {
