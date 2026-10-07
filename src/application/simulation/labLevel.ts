@@ -45,6 +45,13 @@ function expandAreas(areas: readonly BlockedRectangle[]): GridPoint[] {
 
 export const LAB_MAP = createGridMap(GRID_WIDTH, GRID_HEIGHT, expandAreas(BLOCKED_AREAS));
 
+// Celda-puerta del upgrade «Puertas y rutas bloqueables»: celda central del
+// hueco sur del cuarto medio-izquierdo, entre la pared vertical x=4 y la
+// pared horizontal y=10. Transitable en el estado inicial (`LAB_MAP` no se
+// modifica); la escena deriva el mapa vivo `currentMap` a partir de este
+// punto según el estado alternado por el jugador.
+export const DOOR_CELL: GridPoint = { x: 6, y: 10 };
+
 // Ruta de patrulla cíclica del guardia. El primer punto coincide con la
 // posición inicial para que el reinicio (R) conserve el estado reproducible.
 // Los puntos se verifican transitables y conectados por A* en

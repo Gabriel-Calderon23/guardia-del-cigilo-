@@ -1,5 +1,6 @@
 import Phaser from "phaser";
 import {
+  DOOR_CELL,
   GUARD_START,
   GRID_HEIGHT,
   GRID_WIDTH,
@@ -15,7 +16,8 @@ import {
   withSoundEvent,
   type PerceptionSimulationState,
 } from "../../application/simulation/perceptionSimulation";
-import { cellCenter, isWalkable, worldToCell, type GridPoint } from "../../domain/model/grid";
+import { cellCenter, isWalkable, worldToCell, type GridMap, type GridPoint } from "../../domain/model/grid";
+import { canToggleDoor, withDoorState } from "../../domain/model/door";
 import type { Vector2 } from "../../domain/model/vector";
 import { advanceAlongPath } from "../../domain/navigation/pathFollower";
 import { nextPatrolPoint } from "../../domain/navigation/patrolRoute";
@@ -48,6 +50,7 @@ import { timeSinceLastPerception } from "../../domain/perception/memory";
 import type { VisionReason, VisionResult } from "../../domain/perception/perception";
 import { ALERT_FEEDBACK, shouldTriggerAlertFeedback } from "../presentation/alertFeedback";
 import { DISTRACTOR_STYLE, distractorOriginLabel } from "../presentation/distractorStyle";
+import { DOOR_STYLE, doorStateLabel } from "../presentation/doorStyle";
 import { visionStyleFor } from "../presentation/visionStyle";
 
 const PLAYER_SPEED = 190;
@@ -125,6 +128,13 @@ export class GameScene extends Phaser.Scene {
   private lastDistractorAtMs: number | null = null;
   private distractorCell: GridPoint | null = null;
   private distractorNotice = "";
+  private toggleDoor!: Phaser.Input.Keyboard.Key;
+  private doorArmed = false;
+  private doorClosed = false;
+  private doorNotice = "";
+  private doorRect: Phaser.GameObjects.Rectangle | null = null;
+  private currentMap: GridMap = LAB_MAP;
+  private walls!: Phaser.Physics.Arcade.StaticGroup;
 
   public constructor() {
     super("GameScene");
@@ -148,18 +158,23 @@ export class GameScene extends Phaser.Scene {
     this.lastDistractorAtMs = null;
     this.distractorCell = null;
     this.distractorNotice = "";
+    this.doorArmed = false;
+    this.doorClosed = false;
+    this.doorNotice = "";
+    this.doorRect = null;
+    this.currentMap = LAB_MAP;
     this.cameras.main.setBackgroundColor("#10161c");
     this.cameras.main.resetFX();
     this.drawGrid();
 
-    const walls = this.physics.add.staticGroup();
+    this.walls = this.physics.add.staticGroup();
     for (let y = 0; y < GRID_HEIGHT; y += 1) {
       for (let x = 0; x < GRID_WIDTH; x += 1) {
-        if (!isWalkable(LAB_MAP, { x, y })) {
+        if (!isWalkable(this.currentMap, { x, y })) {
           const center = cellCenter({ x, y }, TILE_SIZE);
           const wall = this.add.rectangle(center.x, center.y, TILE_SIZE, TILE_SIZE, 0x27333d);
           wall.setStrokeStyle(1, 0x3a4c58);
-          walls.add(wall);
+          this.walls.add(wall);
         }
       }
     }
@@ -171,7 +186,7 @@ export class GameScene extends Phaser.Scene {
     this.physics.add.existing(this.player);
     this.playerBody = this.player.body as Phaser.Physics.Arcade.Body;
     this.playerBody.setCollideWorldBounds(true);
-    this.physics.add.collider(this.player, walls);
+    this.physics.add.collider(this.player, this.walls);
 
     const keyboard = this.input.keyboard;
     if (!keyboard) {
@@ -187,6 +202,7 @@ export class GameScene extends Phaser.Scene {
     this.toggleAlgorithm = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
     this.emitSound = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.Q);
     this.toggleDistractor = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.E);
+    this.toggleDoor = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.F);
 
     this.perceptionGraphics = this.add.graphics().setDepth(1);
     this.navigationGraphics = this.add.graphics().setDepth(2);
@@ -281,6 +297,11 @@ export class GameScene extends Phaser.Scene {
       this.distractorNotice = "";
     }
 
+    if (Phaser.Input.Keyboard.JustDown(this.toggleDoor)) {
+      this.doorArmed = !this.doorArmed;
+      this.doorNotice = "";
+    }
+
     const horizontal = Number(this.cursors.right.isDown || this.moveRight.isDown)
       - Number(this.cursors.left.isDown || this.moveLeft.isDown);
     const vertical = Number(this.cursors.down.isDown || this.moveDown.isDown)
@@ -314,6 +335,11 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    if (this.doorArmed) {
+      this.toggleDoorAt(pointer);
+      return;
+    }
+
     this.patrolActive = false;
     this.patrolBlocked = false;
     this.pauseState = initialPatrolPause();
@@ -330,7 +356,7 @@ export class GameScene extends Phaser.Scene {
    */
   private activateDistractor(pointer: Phaser.Input.Pointer): void {
     const cell = worldToCell({ x: pointer.worldX, y: pointer.worldY }, TILE_SIZE);
-    if (!isWalkable(LAB_MAP, cell)) {
+    if (!isWalkable(this.currentMap, cell)) {
       this.distractorNotice = "CELDA INVALIDA";
       return;
     }
@@ -341,17 +367,124 @@ export class GameScene extends Phaser.Scene {
 
     this.perceptionState = withSoundEvent(
       this.perceptionState,
-      createDistractorSoundEvent(LAB_MAP, cell, TILE_SIZE, DISTRACTOR_CONFIG, this.time.now),
+      createDistractorSoundEvent(this.currentMap, cell, TILE_SIZE, DISTRACTOR_CONFIG, this.time.now),
     );
     this.lastDistractorAtMs = this.time.now;
     this.distractorCell = cell;
     this.distractorNotice = "ACTIVO";
   }
 
+  /**
+   * Alterna la celda-puerta cuando el modo puerta (F) está armado. Sólo
+   * `DOOR_CELL` puede alternarse y el cierre se valida contra la ocupación de
+   * guardia y jugador. La replanificación de la ruta activa llega en el
+   * incremento 4.
+   */
+  private toggleDoorAt(pointer: Phaser.Input.Pointer): void {
+    const cell = worldToCell({ x: pointer.worldX, y: pointer.worldY }, TILE_SIZE);
+    if (cell.x !== DOOR_CELL.x || cell.y !== DOOR_CELL.y) {
+      this.doorNotice = "SOLO PUERTA";
+      return;
+    }
+
+    const playerCell = worldToCell({ x: this.player.x, y: this.player.y }, TILE_SIZE);
+    const guardCell = worldToCell({ x: this.guard.x, y: this.guard.y }, TILE_SIZE);
+    const decision = canToggleDoor(this.currentMap, DOOR_CELL, [playerCell, guardCell]);
+    if (decision === "occupied") {
+      this.doorNotice = "CELDA OCUPADA";
+      return;
+    }
+    if (decision === "out-of-bounds") {
+      this.doorNotice = "SOLO PUERTA";
+      return;
+    }
+    this.setDoorClosed(!this.doorClosed);
+  }
+
+  /** Aplica el nuevo estado de la puerta: mapa vivo, rectángulo en `walls` y HUD. */
+  private setDoorClosed(closed: boolean): void {
+    const result = withDoorState(this.currentMap, DOOR_CELL, closed);
+    if (!result.ok) {
+      this.doorNotice = "SOLO PUERTA";
+      return;
+    }
+
+    this.currentMap = result.map;
+    this.doorClosed = closed;
+    this.doorNotice = "";
+
+    if (closed) {
+      const center = cellCenter(DOOR_CELL, TILE_SIZE);
+      const rect = this.add.rectangle(
+        center.x,
+        center.y,
+        TILE_SIZE,
+        TILE_SIZE,
+        DOOR_STYLE.closedCellColor,
+      );
+      rect.setStrokeStyle(DOOR_STYLE.markerLineWidth, DOOR_STYLE.markerColor);
+      this.walls.add(rect);
+      this.uiCamera.ignore(rect);
+      this.doorRect = rect;
+    } else if (this.doorRect) {
+      this.walls.remove(this.doorRect, true, true);
+      this.doorRect = null;
+    }
+
+    this.replanAfterDoorChange();
+  }
+
+  /**
+   * Recalcula la ruta activa sobre `currentMap` inmediatamente después de
+   * alternar la puerta (sólo en el evento del clic, sin bucles por fotograma):
+   * patrulla activa → leg de patrulla con `patrolBlocked` si fracasa; ruta
+   * manual → `renderNavigation`; investigación en tránsito → recálculo hacia
+   * `targetCell` y, si falla, cancelación con aviso y retoma de patrulla (A2).
+   * En pausa o inspección no hay ruta activa: el recálculo ocurre al salir
+   * (precedente `updateGuardPause` / `updateInvestigationInspect`).
+   */
+  private replanAfterDoorChange(): void {
+    if (this.investigationState.phase === "traveling") {
+      this.replanInvestigation();
+      return;
+    }
+    if (
+      this.pauseState.phase === "paused"
+      || this.investigationState.phase === "inspecting"
+    ) {
+      return;
+    }
+    if (this.patrolActive) {
+      this.renderPatrolLeg();
+      return;
+    }
+    this.renderNavigation();
+  }
+
+  /** Recálculo de una investigación en tránsito hacia su objetivo (A2 de la spec). */
+  private replanInvestigation(): void {
+    const target = this.investigationState.targetCell;
+    if (!target) {
+      this.cancelInvestigation();
+      return;
+    }
+
+    const guardCell = worldToCell({ x: this.guard.x, y: this.guard.y }, TILE_SIZE);
+    const result = calculateRoute(this.currentMap, guardCell, target, this.navigationAlgorithm);
+    if (result.status === "success") {
+      this.renderRoute(result, target, " / INVESTIGAR");
+      return;
+    }
+
+    this.investigationState = initialInvestigation();
+    this.investigationNotice = `RUTA BLOQUEADA (${STATUS_LABELS[result.status]})`;
+    this.renderPatrolLeg();
+  }
+
   private renderNavigation(): void {
     const guardCell = worldToCell({ x: this.guard.x, y: this.guard.y }, TILE_SIZE);
     const result = calculateRoute(
-      LAB_MAP,
+      this.currentMap,
       guardCell,
       this.navigationGoal,
       this.navigationAlgorithm,
@@ -363,7 +496,7 @@ export class GameScene extends Phaser.Scene {
     this.patrolActive = true;
     const target = nextPatrolPoint(PATROL_POINTS, this.patrolIndex);
     const guardCell = worldToCell({ x: this.guard.x, y: this.guard.y }, TILE_SIZE);
-    const result = calculateRoute(LAB_MAP, guardCell, target, this.navigationAlgorithm);
+    const result = calculateRoute(this.currentMap, guardCell, target, this.navigationAlgorithm);
     this.patrolBlocked = result.status !== "success";
     this.renderRoute(result, target, " / PATRULLA");
   }
@@ -477,7 +610,7 @@ export class GameScene extends Phaser.Scene {
   private beginInvestigation(position: Vector2): void {
     const cell = worldToCell(position, TILE_SIZE);
     const guardCell = worldToCell({ x: this.guard.x, y: this.guard.y }, TILE_SIZE);
-    const result = calculateRoute(LAB_MAP, guardCell, cell, this.navigationAlgorithm);
+    const result = calculateRoute(this.currentMap, guardCell, cell, this.navigationAlgorithm);
     if (result.status !== "success") {
       this.investigationNotice = `RUIDO INALCANZABLE (${result.status})`;
       return;
@@ -520,7 +653,7 @@ export class GameScene extends Phaser.Scene {
     const observer = { x: this.guard.x, y: this.guard.y };
     const target = { x: this.player.x, y: this.player.y };
     const frame = updatePerceptionSimulation(this.perceptionState, {
-      map: LAB_MAP,
+      map: this.currentMap,
       tileSize: TILE_SIZE,
       observer,
       facing: this.guardFacing,
@@ -658,6 +791,7 @@ export class GameScene extends Phaser.Scene {
       `sonido ${sound}`,
       memory,
       this.distractorTelemetryLine(),
+      this.doorTelemetryLine(),
     ];
     const investigationLine = this.investigationTelemetryLine();
     if (investigationLine) {
@@ -686,6 +820,14 @@ export class GameScene extends Phaser.Scene {
     return this.distractorNotice
       ? `distractor ${mode}${origin} | ${this.distractorNotice}`
       : `distractor ${mode}${origin}`;
+  }
+
+  private doorTelemetryLine(): string {
+    const mode = this.doorArmed ? "ARMADO" : "INACTIVO";
+    const state = doorStateLabel(DOOR_CELL, this.doorClosed);
+    return this.doorNotice
+      ? `${state} | ${mode} ${this.doorNotice}`
+      : `${state} | ${mode}`;
   }
 
   private investigationTelemetryLine(): string {
