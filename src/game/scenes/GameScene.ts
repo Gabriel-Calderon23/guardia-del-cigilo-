@@ -27,11 +27,27 @@ import {
   type PatrolPauseConfig,
   type PatrolPauseState,
 } from "../../domain/navigation/pauseBehavior";
+import {
+  advanceInvestigation,
+  arriveAtInvestigationTarget,
+  initialInvestigation,
+  shouldCancelInvestigation,
+  shouldStartInvestigation,
+  startInvestigation,
+  type InvestigationConfig,
+  type InvestigationState,
+} from "../../domain/navigation/investigationBehavior";
 import type { SearchAlgorithm, SearchResult, SearchStatus } from "../../domain/navigation/search";
 import { evaluateAlertLevel, type AlertConfig, type AlertLevel } from "../../domain/perception/alert";
+import {
+  DISTRACTOR_CONFIG,
+  canActivateDistractor,
+  createDistractorSoundEvent,
+} from "../../domain/perception/distractor";
 import { timeSinceLastPerception } from "../../domain/perception/memory";
 import type { VisionReason, VisionResult } from "../../domain/perception/perception";
 import { ALERT_FEEDBACK, shouldTriggerAlertFeedback } from "../presentation/alertFeedback";
+import { DISTRACTOR_STYLE, distractorOriginLabel } from "../presentation/distractorStyle";
 import { visionStyleFor } from "../presentation/visionStyle";
 
 const PLAYER_SPEED = 190;
@@ -45,6 +61,9 @@ const GAZE_SWEEP_RADIANS = Math.PI / 3;
 const PATROL_PAUSE_CONFIG: PatrolPauseConfig = {
   pauseMs: PATROL_PAUSE_MS,
   sweepRadians: GAZE_SWEEP_RADIANS,
+};
+const INVESTIGATION_CONFIG: InvestigationConfig = {
+  inspectMs: PATROL_PAUSE_MS,
 };
 const SUSPICION_WINDOW_MS = 2000;
 const ALERT_CONFIG: AlertConfig = { suspicionWindowMs: SUSPICION_WINDOW_MS };
@@ -79,10 +98,12 @@ export class GameScene extends Phaser.Scene {
   private reset!: Phaser.Input.Keyboard.Key;
   private toggleAlgorithm!: Phaser.Input.Keyboard.Key;
   private emitSound!: Phaser.Input.Keyboard.Key;
+  private toggleDistractor!: Phaser.Input.Keyboard.Key;
   private navigationGraphics!: Phaser.GameObjects.Graphics;
   private perceptionGraphics!: Phaser.GameObjects.Graphics;
   private targetMarker!: Phaser.GameObjects.Arc;
   private lastKnownMarker!: Phaser.GameObjects.Arc;
+  private distractorMarker!: Phaser.GameObjects.Arc;
   private navigationHud!: Phaser.GameObjects.Text;
   private titleText!: Phaser.GameObjects.Text;
   private uiCamera!: Phaser.Cameras.Scene2D.Camera;
@@ -98,6 +119,12 @@ export class GameScene extends Phaser.Scene {
   private pauseState: PatrolPauseState = initialPatrolPause();
   private perceptionState: PerceptionSimulationState = initialPerceptionState();
   private alertLevel: AlertLevel = "patrol";
+  private investigationState: InvestigationState = initialInvestigation();
+  private investigationNotice = "";
+  private distractorArmed = false;
+  private lastDistractorAtMs: number | null = null;
+  private distractorCell: GridPoint | null = null;
+  private distractorNotice = "";
 
   public constructor() {
     super("GameScene");
@@ -115,6 +142,12 @@ export class GameScene extends Phaser.Scene {
     this.pauseState = startPatrolPause(this.guardFacing, PATROL_PAUSE_CONFIG);
     this.perceptionState = initialPerceptionState();
     this.alertLevel = "patrol";
+    this.investigationState = initialInvestigation();
+    this.investigationNotice = "";
+    this.distractorArmed = false;
+    this.lastDistractorAtMs = null;
+    this.distractorCell = null;
+    this.distractorNotice = "";
     this.cameras.main.setBackgroundColor("#10161c");
     this.cameras.main.resetFX();
     this.drawGrid();
@@ -153,6 +186,7 @@ export class GameScene extends Phaser.Scene {
     this.reset = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.R);
     this.toggleAlgorithm = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
     this.emitSound = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.Q);
+    this.toggleDistractor = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.E);
 
     this.perceptionGraphics = this.add.graphics().setDepth(1);
     this.navigationGraphics = this.add.graphics().setDepth(2);
@@ -168,6 +202,15 @@ export class GameScene extends Phaser.Scene {
     this.lastKnownMarker = this.add
       .circle(0, 0, 7, 0x000000, 0)
       .setStrokeStyle(2, 0xe16969)
+      .setDepth(5)
+      .setVisible(false);
+    this.distractorMarker = this.add
+      .circle(0, 0, DISTRACTOR_STYLE.markerRadius, 0x000000, 0)
+      .setStrokeStyle(
+        2,
+        DISTRACTOR_STYLE.markerColor,
+        DISTRACTOR_STYLE.markerAlpha,
+      )
       .setDepth(5)
       .setVisible(false);
 
@@ -233,6 +276,11 @@ export class GameScene extends Phaser.Scene {
       });
     }
 
+    if (Phaser.Input.Keyboard.JustDown(this.toggleDistractor)) {
+      this.distractorArmed = !this.distractorArmed;
+      this.distractorNotice = "";
+    }
+
     const horizontal = Number(this.cursors.right.isDown || this.moveRight.isDown)
       - Number(this.cursors.left.isDown || this.moveLeft.isDown);
     const vertical = Number(this.cursors.down.isDown || this.moveDown.isDown)
@@ -261,11 +309,43 @@ export class GameScene extends Phaser.Scene {
   }
 
   private handlePointerDown(pointer: Phaser.Input.Pointer): void {
+    if (this.distractorArmed) {
+      this.activateDistractor(pointer);
+      return;
+    }
+
     this.patrolActive = false;
     this.patrolBlocked = false;
     this.pauseState = initialPatrolPause();
+    this.investigationState = initialInvestigation();
+    this.investigationNotice = "";
     this.navigationGoal = worldToCell({ x: pointer.worldX, y: pointer.worldY }, TILE_SIZE);
     this.renderNavigation();
+  }
+
+  /**
+   * Activa el distractor en la celda apuntada. Sólo modifica la percepción
+   * (evento de sonido) y la telemetría; no mueve al guardia: eso corresponde al
+   * incremento de investigación.
+   */
+  private activateDistractor(pointer: Phaser.Input.Pointer): void {
+    const cell = worldToCell({ x: pointer.worldX, y: pointer.worldY }, TILE_SIZE);
+    if (!isWalkable(LAB_MAP, cell)) {
+      this.distractorNotice = "CELDA INVALIDA";
+      return;
+    }
+    if (!canActivateDistractor(this.lastDistractorAtMs, this.time.now, DISTRACTOR_CONFIG)) {
+      this.distractorNotice = "EN ENFRIAMIENTO";
+      return;
+    }
+
+    this.perceptionState = withSoundEvent(
+      this.perceptionState,
+      createDistractorSoundEvent(LAB_MAP, cell, TILE_SIZE, DISTRACTOR_CONFIG, this.time.now),
+    );
+    this.lastDistractorAtMs = this.time.now;
+    this.distractorCell = cell;
+    this.distractorNotice = "ACTIVO";
   }
 
   private renderNavigation(): void {
@@ -341,6 +421,10 @@ export class GameScene extends Phaser.Scene {
       this.updateGuardPause(delta);
       return;
     }
+    if (this.investigationState.phase === "inspecting") {
+      this.updateInvestigationInspect(delta);
+      return;
+    }
 
     const previous = { x: this.guard.x, y: this.guard.y };
     const movement = advanceAlongPath(
@@ -357,7 +441,12 @@ export class GameScene extends Phaser.Scene {
     }
 
     if (movement.completed) {
-      if (this.patrolActive) {
+      if (this.investigationState.phase === "traveling") {
+        this.investigationState = arriveAtInvestigationTarget(
+          this.investigationState,
+          INVESTIGATION_CONFIG,
+        );
+      } else if (this.patrolActive) {
         if (!this.patrolBlocked) {
           this.beginPauseAtPatrolPoint();
         }
@@ -365,6 +454,44 @@ export class GameScene extends Phaser.Scene {
         this.resumePatrolAfterManual();
       }
     }
+  }
+
+  private updateInvestigationInspect(delta: number): void {
+    this.investigationState = advanceInvestigation(
+      this.investigationState,
+      delta,
+      INVESTIGATION_CONFIG,
+    );
+    if (this.investigationState.phase === "idle") {
+      this.investigationNotice = "";
+      this.renderPatrolLeg();
+    }
+  }
+
+  /**
+   * Fija la investigación hacia la posición del ruido: valida la celda, calcula
+   * la ruta con A* / BFS y la enruta con `renderRoute`. Un destino inalcanzable
+   * produce un fracaso explícito (C-10) sin cambiar de fase: el guardia retoma
+   * su conducta actual.
+   */
+  private beginInvestigation(position: Vector2): void {
+    const cell = worldToCell(position, TILE_SIZE);
+    const guardCell = worldToCell({ x: this.guard.x, y: this.guard.y }, TILE_SIZE);
+    const result = calculateRoute(LAB_MAP, guardCell, cell, this.navigationAlgorithm);
+    if (result.status !== "success") {
+      this.investigationNotice = `RUIDO INALCANZABLE (${result.status})`;
+      return;
+    }
+    this.investigationState = startInvestigation(cell, INVESTIGATION_CONFIG);
+    this.pauseState = initialPatrolPause();
+    this.renderRoute(result, cell, " / INVESTIGAR");
+  }
+
+  /** Aborta una investigación en curso y retoma la patrulla desde el índice actual. */
+  private cancelInvestigation(): void {
+    this.investigationState = initialInvestigation();
+    this.investigationNotice = "";
+    this.renderPatrolLeg();
   }
 
   private updateGuardPause(delta: number): void {
@@ -403,6 +530,36 @@ export class GameScene extends Phaser.Scene {
       timeMs: time,
     });
     this.perceptionState = frame.state;
+    if (!frame.state.soundEvent) {
+      this.distractorCell = null;
+    }
+
+    const signals = {
+      visionVisible: frame.vision.visible,
+      soundHeard: frame.soundHeard,
+    };
+    if (
+      shouldStartInvestigation(this.investigationState, signals)
+      && this.perceptionState.soundEvent
+    ) {
+      this.beginInvestigation(this.perceptionState.soundEvent.position);
+    } else if (
+      this.investigationState.phase !== "idle"
+      && !signals.visionVisible
+      && signals.soundHeard
+      && this.perceptionState.soundEvent
+    ) {
+      const heardCell = worldToCell(this.perceptionState.soundEvent.position, TILE_SIZE);
+      const target = this.investigationState.targetCell;
+      const sameCell = target !== null
+        && target.x === heardCell.x
+        && target.y === heardCell.y;
+      if (!sameCell) {
+        this.beginInvestigation(this.perceptionState.soundEvent.position);
+      }
+    } else if (shouldCancelInvestigation(this.investigationState, signals)) {
+      this.cancelInvestigation();
+    }
 
     const nextAlertLevel = evaluateAlertLevel(
       {
@@ -458,12 +615,23 @@ export class GameScene extends Phaser.Scene {
     this.perceptionGraphics.fillPath();
 
     if (this.perceptionState.soundEvent) {
-      this.perceptionGraphics.lineStyle(2, 0xe5b454, 0.8);
+      this.perceptionGraphics.lineStyle(
+        DISTRACTOR_STYLE.ringLineWidth,
+        DISTRACTOR_STYLE.ringColor,
+        DISTRACTOR_STYLE.ringAlpha,
+      );
       this.perceptionGraphics.strokeCircle(
         this.perceptionState.soundEvent.position.x,
         this.perceptionState.soundEvent.position.y,
         this.perceptionState.soundEvent.radius,
       );
+    }
+
+    if (this.perceptionState.soundEvent && this.distractorCell) {
+      const marker = cellCenter(this.distractorCell, TILE_SIZE);
+      this.distractorMarker.setPosition(marker.x, marker.y).setVisible(true);
+    } else {
+      this.distractorMarker.setVisible(false);
     }
 
     const lastKnown = this.perceptionState.memory.lastKnownPosition;
@@ -482,14 +650,20 @@ export class GameScene extends Phaser.Scene {
       ? (soundHeard ? "OIDO" : "FUERA DE RANGO")
       : "-";
 
-    this.navigationHud.setText([
+    const lines = [
       ...this.navigationSummary,
       this.patrolTelemetryLine(),
       `alerta ${ALERT_LABELS[this.alertLevel]}`,
       `vision ${VISION_LABELS[vision.reason]}`,
       `sonido ${sound}`,
       memory,
-    ]);
+      this.distractorTelemetryLine(),
+    ];
+    const investigationLine = this.investigationTelemetryLine();
+    if (investigationLine) {
+      lines.push(investigationLine);
+    }
+    this.navigationHud.setText(lines);
   }
 
   private patrolTelemetryLine(): string {
@@ -502,5 +676,27 @@ export class GameScene extends Phaser.Scene {
       return this.patrolBlocked ? "patrulla bloqueada" : "patrulla";
     }
     return "ruta manual";
+  }
+
+  private distractorTelemetryLine(): string {
+    const mode = this.distractorArmed ? "ARMADO" : "INACTIVO";
+    const origin = this.distractorCell
+      ? ` @${distractorOriginLabel(this.distractorCell)}`
+      : "";
+    return this.distractorNotice
+      ? `distractor ${mode}${origin} | ${this.distractorNotice}`
+      : `distractor ${mode}${origin}`;
+  }
+
+  private investigationTelemetryLine(): string {
+    if (this.investigationState.phase === "traveling") {
+      return this.investigationNotice
+        ? `investigando | ${this.investigationNotice}`
+        : "investigando";
+    }
+    if (this.investigationState.phase === "inspecting") {
+      return `inspeccion ${(this.investigationState.remainingMs / 1000).toFixed(1)}s`;
+    }
+    return this.investigationNotice ? `investigando | ${this.investigationNotice}` : "";
   }
 }
